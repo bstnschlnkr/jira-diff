@@ -12,7 +12,7 @@ const normalizeDomainPattern = domain => {
   return normalized || null;
 };
 
-const isValidDomainPattern = domain => /^[a-z0-9.-]+$/.test(domain) && !domain.includes('..');
+const isValidDomainPattern = domain => typeof domain === 'string' && /^[a-z0-9.-]+$/.test(domain) && !domain.includes('..');
 
 const parseDomainPatterns = raw => {
   const values = Array.isArray(raw) ? raw : String(raw || '').split(/[\n,]+/);
@@ -39,13 +39,21 @@ const getGrantedPermissionDomains = () => new Promise(resolve => {
   });
 });
 
-async function syncCustomDomainContentScript() {
+// Several events (popup, permission grant, storage change) can trigger a sync at the same time.
+// Run them one after another so register/unregister calls don't collide ("Duplicate script ID").
+let syncQueue = Promise.resolve();
+function syncCustomDomainContentScript() {
+  const run = syncQueue.then(doSyncCustomDomainContentScript);
+  syncQueue = run.catch(() => {});
+  return run;
+}
+
+async function doSyncCustomDomainContentScript() {
   if (!chrome.scripting?.registerContentScripts) return;
 
-  try {
-    await chrome.scripting.unregisterContentScripts({ ids: [CUSTOM_CONTENT_SCRIPT_ID] });
-  } catch {
-    // The script may not have been registered yet.
+  const registered = await chrome.scripting.getRegisteredContentScripts({ ids: [CUSTOM_CONTENT_SCRIPT_ID] }).catch(() => []);
+  if (registered.length) {
+    await chrome.scripting.unregisterContentScripts({ ids: [CUSTOM_CONTENT_SCRIPT_ID] }).catch(() => {});
   }
 
   const { allowedDomains } = await chrome.storage.sync.get('allowedDomains');
@@ -81,7 +89,9 @@ chrome.runtime.onInstalled.addListener(async () => {
     return;
   }
 
-  await syncCustomDomainContentScript();
+  await syncCustomDomainContentScript().catch(err => {
+    console.error('Failed to register custom Jira domain content scripts:', err);
+  });
 
   for (const cs of chrome.runtime.getManifest().content_scripts) {
     const tabs = await chrome.tabs.query({ url: cs.matches });
@@ -108,6 +118,29 @@ chrome.runtime.onStartup?.addListener(() => {
   });
 });
 
+// The permission prompt often closes the popup before it can save the domain.
+// Persist newly granted origins here, where the code keeps running.
+chrome.permissions.onAdded?.addListener(permissions => {
+  persistGrantedOrigins(permissions).catch(err => console.error('Failed to save granted Jira domain:', err));
+});
+
+async function persistGrantedOrigins(permissions) {
+  const granted = parseDomainPatterns(permissions?.origins || []).filter(d => !isAtlassianDomain(d));
+  if (!granted.length) return;
+  const { allowedDomains } = await chrome.storage.sync.get('allowedDomains');
+  const current = parseDomainPatterns(allowedDomains);
+  const next = [...new Set([...current, ...granted])];
+  if (next.length !== current.length) {
+    await chrome.storage.sync.set({ allowedDomains: next }); // triggers sync via onChanged
+  } else {
+    await syncCustomDomainContentScript();
+  }
+}
+
+chrome.permissions.onRemoved?.addListener(() => {
+  syncCustomDomainContentScript().catch(err => console.error('Failed to resync content scripts:', err));
+});
+
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'sync' || !changes.allowedDomains) return;
 
@@ -131,6 +164,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 chrome.tabs.onActivated.addListener(activeInfo => {
   chrome.tabs.get(activeInfo.tabId, tab => {
+    if (chrome.runtime.lastError || !tab) return;
     if (!chrome.runtime?.id) {
       console.error('Extension context invalidated during tab activation.');
       return;
